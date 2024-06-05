@@ -1,5 +1,3 @@
-import numpy as np
-import tensorflow as tf
 import os
 import pandas as pd
 import numpy as np
@@ -10,6 +8,18 @@ from tensorflow.keras.preprocessing.image import ImageDataGenerator
 from tensorflow.keras.layers import Input, Conv2D, MaxPooling2D, UpSampling2D, Concatenate
 from tensorflow.keras.models import Model
 from sklearn.metrics import precision_score, recall_score, f1_score
+from tensorflow.keras import backend as K
+
+def focal_loss(gamma=2., alpha=0.25):
+    def focal_loss_fixed(y_true, y_pred):
+        epsilon = K.epsilon()
+        y_pred = K.clip(y_pred, epsilon, 1. - epsilon)
+        y_true = K.cast(y_true, tf.float32)
+        alpha_t = y_true * alpha + (K.ones_like(y_true) - y_true) * (1 - alpha)
+        p_t = y_true * y_pred + (K.ones_like(y_true) - y_true) * (1 - y_pred)
+        fl = - alpha_t * K.pow((K.ones_like(y_true) - p_t), gamma) * K.log(p_t)
+        return K.mean(fl)
+    return focal_loss_fixed
 
 def load_images_and_masks(data_dir):
     images = []
@@ -58,50 +68,56 @@ def load_images_and_masks(data_dir):
     
     return np.array(images), np.array(masks)
 
-def data_generator(image_generator, mask_generator):
-    while True:
-        image_batch = next(image_generator)
-        mask_batch = next(mask_generator)
-        yield image_batch, mask_batch
-
-def preprocess_and_augment(images, masks, target_size=(256, 256), augment=True):
-    # Resize images and masks to the target size
-    images_resized = np.array([cv2.resize(image, target_size) for image in images])
-    masks_resized = np.array([cv2.resize(mask, target_size, interpolation=cv2.INTER_NEAREST) for mask in masks])
+def extract_patches(image, patch_size=32, stride=8):
+    patches = []
+    coordinates = []
+    if len(image.shape) == 3:
+        h, w, _ = image.shape
+    else:
+        h, w = image.shape
     
+    for y in range(0, h - patch_size + 1, stride):
+        for x in range(0, w - patch_size + 1, stride):
+            patch = image[y:y + patch_size, x:x + patch_size]
+            patches.append(patch)
+            coordinates.append((y, x))
+    return np.array(patches), coordinates
+
+
+def reconstruct_mask(pred_patches, coordinates, image_shape, patch_size=32, stride=8):
+    mask = np.zeros((image_shape[0], image_shape[1]))
+    count = np.zeros((image_shape[0], image_shape[1]))
+
+    for i, (y, x) in enumerate(coordinates):
+        mask[y:y + patch_size, x:x + patch_size] += pred_patches[i].squeeze()
+        count[y:y + patch_size, x:x + patch_size] += 1
+    
+    mask = mask / count
+    return mask
+
+
+def preprocess_and_augment(images, masks, patch_size=32, stride=8):
+    patch_images = []
+    patch_masks = []
+
+    for image, mask in zip(images, masks):
+        patches, _ = extract_patches(image, patch_size, stride)
+        mask_patches, _ = extract_patches(mask, patch_size, stride)
+        patch_images.extend(patches)
+        patch_masks.extend(mask_patches)
+    
+    patch_images = np.array(patch_images)
+    patch_masks = np.array(patch_masks)
+
     # Normalize images
-    images_resized = images_resized / 255.0
+    patch_images = patch_images / 255.0
     
     # Add a channel dimension to masks
-    masks_resized = np.expand_dims(masks_resized, axis=-1)
-    
-    if augment:
-        data_gen_args = dict(
-            rotation_range=90,
-            width_shift_range=0.1,
-            height_shift_range=0.1,
-            shear_range=0.2,
-            zoom_range=0.2,
-            horizontal_flip=True,
-            vertical_flip=True,
-            fill_mode='nearest'
-        )
+    patch_masks = np.expand_dims(patch_masks, axis=-1)
 
-        image_datagen = ImageDataGenerator(**data_gen_args)
-        mask_datagen = ImageDataGenerator(**data_gen_args)
+    return patch_images, patch_masks
 
-        image_datagen.fit(images_resized, augment=True)
-        mask_datagen.fit(masks_resized, augment=True)
-
-        image_generator = image_datagen.flow(images_resized, batch_size=32, seed=1)
-        mask_generator = mask_datagen.flow(masks_resized, batch_size=32, seed=1)
-
-        train_generator = data_generator(image_generator, mask_generator)
-        return train_generator, len(images_resized) // 32
-    else:
-        return images_resized, masks_resized
-
-def cross_validation(images, masks, n_splits=5):
+def cross_validation(images, masks, n_splits=5, patch_size=32, stride=8):
     kf = KFold(n_splits=n_splits, shuffle=True, random_state=42)
     fold_results = []
 
@@ -109,14 +125,14 @@ def cross_validation(images, masks, n_splits=5):
         X_train, X_val = images[train_index], images[val_index]
         y_train, y_val = masks[train_index], masks[val_index]
 
-        train_generator, steps_per_epoch = preprocess_and_augment(X_train, y_train)
-        X_val, y_val = preprocess_and_augment(X_val, y_val, augment=False)
+        X_train_patches, y_train_patches = preprocess_and_augment(X_train, y_train, patch_size, stride)
+        X_val_patches, y_val_patches = preprocess_and_augment(X_val, y_val, patch_size, stride)
 
-        fold_results.append((train_generator, (X_val, y_val), steps_per_epoch))
+        fold_results.append((X_train_patches, y_train_patches, X_val, y_val, X_val_patches, y_val_patches))
     
     return fold_results
 
-def unet_model(input_size=(256, 256, 3)):
+def unet_model(input_size=(32, 32, 3)):
     inputs = Input(input_size)
     
     # Encoder
@@ -164,7 +180,7 @@ def unet_model(input_size=(256, 256, 3)):
 
     model = Model(inputs=[inputs], outputs=[outputs])
     
-    model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy', 'Precision', 'Recall'])
+    model.compile(optimizer='adam', loss=focal_loss(), metrics=['accuracy', 'Precision', 'Recall'])
     
     return model
 
@@ -180,9 +196,10 @@ def calculate_metrics(y_true, y_pred):
     
     return precision, recall, f1
 
+
 def main():
     data_dir = 'scanner_A'  # Your data directory
-    input_size = (256, 256, 3)  # Define the input size for the model
+    input_size = (32, 32, 3)  # Define the input size for the model
 
     # Load images and masks
     images, masks = load_images_and_masks(data_dir)
@@ -195,38 +212,32 @@ def main():
     print(f"Mitosis pixels: {num_mitosis_pixels}, Non-mitosis pixels: {num_non_mitosis_pixels}")
 
     # Perform 5-fold cross-validation
-    fold_results = cross_validation(images, masks)
+    fold_results = cross_validation(images, masks, patch_size=32, stride=8)
 
     # Example of using the fold results for training and validation
-    for fold_num, (train_gen, (X_val, y_val), steps_per_epoch) in enumerate(fold_results):
+    for fold_num, (X_train_patches, y_train_patches, X_val, y_val, X_val_patches, y_val_patches) in enumerate(fold_results):
         print(f"Fold {fold_num + 1}")
 
-        # Here you can define and compile your model
+        # Define and compile the model
         model = unet_model(input_size=input_size)
 
-        # Create TensorFlow dataset from the generator
-        train_dataset = tf.data.Dataset.from_generator(
-            lambda: train_gen,
-            output_signature=(
-                tf.TensorSpec(shape=(None, input_size[0], input_size[1], input_size[2]), dtype=tf.float32),
-                tf.TensorSpec(shape=(None, input_size[0], input_size[1], 1), dtype=tf.float32)
-            )
-        )
-
         # Train the model using the training generator and validate it on the validation data
-        model.fit(train_dataset,
-                  validation_data=(X_val, y_val),
+        model.fit(X_train_patches, y_train_patches,
+                  validation_data=(X_val_patches, y_val_patches),
                   epochs=10,  # Adjust the number of epochs as needed
-                  steps_per_epoch=2)  # Adjust steps per epoch as needed
+                  batch_size=3)  # Adjust batch size as needed
 
-        # Evaluate the model on the validation data
-        val_preds = model.predict(X_val)
-        val_preds = (val_preds > 0.5).astype(np.uint8)  # Convert predictions to binary masks
+        # Predict on validation patches
+        val_patch_preds = model.predict(X_val_patches)
+        val_patch_preds = (val_patch_preds > 0.5).astype(np.uint8)  # Convert predictions to binary masks
 
-        precision, recall, f1 = calculate_metrics(y_val.flatten(), val_preds.flatten())
+        # Reconstruct the full validation mask
+        val_mask_pred = reconstruct_mask(val_patch_preds, [c for _, c in extract_patches(X_val[0], patch_size=32, stride=8)], X_val[0].shape, patch_size=32, stride=8)
+        
+        precision, recall, f1 = calculate_metrics(y_val.flatten(), val_mask_pred.flatten())
         print(f"Fold {fold_num + 1} - Precision: {precision:.4f}, Recall: {recall:.4f}, F1-score: {f1:.4f}")
 
     print("Training and evaluation completed.")
-
+    model.save('model.h5')
 if __name__ == "__main__":
     main()
